@@ -1,6 +1,8 @@
-# Multi-Account JobRight Scraper
+# Multi-Account JobRight Scraper 🚀
 
-🚀 **Enhanced JobRight scraper that simultaneously uses up to 80 accounts for maximum job diversity and data collection.**
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/tnd0n/multi-account-jobright-scraper)
+
+> **Created by TND0N** | Enhanced JobRight scraper that simultaneously uses up to 80 accounts for maximum job diversity and data collection.
 
 ## 🌟 Features
 
@@ -11,41 +13,28 @@
 - Configurable concurrency
 - Real-time progress tracking
 
-## 🚀 Deployment
+## 🚀 Quick Deploy
 
-### Deploy to Render
+### One-Click Deploy to Render
 
-1. **Sign up / log in to Render**: https://render.com
+Deploy instantly with pre-configured settings:
 
-2. **Create a new Web Service**
-   - Connect your GitHub account
-   - Select the `tnd0n/multi-account-jobright-scraper` repository
-   - Branch: `main`
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/tnd0n/multi-account-jobright-scraper)
 
-3. **Configure build and start commands**
+### Manual Render Deployment
 
-   **Build Command:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-   **Start Command:**
-   ```bash
-   gunicorn --bind 0.0.0.0:$PORT --workers 4 app:app
-   ```
-
-4. **Set Environment Variables**
-   - Add `GOOGLE_SERVICE_ACCOUNT_JSON` with your service account JSON string
-
-5. **Specify instance details**
-   - Select instance type (e.g., Starter or Standard based on needs)
-   - Set region close to your users
-
-6. **Deploy**
-   - Click Deploy
-
-7. **Access your app**
-   - Use the Render-provided URL, e.g., `https://your-app-name.onrender.com`
+1. **Fork this repository** to your GitHub account
+2. **Connect to Render**:
+   - Go to [Render Dashboard](https://dashboard.render.com/)
+   - Click "New +" → "Web Service"
+   - Connect your GitHub repository
+3. **Configure deployment**:
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `gunicorn --bind 0.0.0.0:$PORT --workers 4 --reuse-port app:app`
+4. **Set Environment Variables**:
+   - `FLASK_SECRET_KEY`: Generate a secure random key
+   - `GOOGLE_SERVICE_ACCOUNT_JSON`: Your Google service account credentials
+5. **Deploy**: Click "Create Web Service"
 
 ## 📄 Local Setup
 
