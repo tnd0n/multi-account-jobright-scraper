@@ -38,9 +38,13 @@ class MultiAccountJobRightScraper:
         self.google_credentials = None
         self.setup_google_credentials()
 
-        # Deduplication
+        # Enhanced deduplication with delta crawling
         self.processed_job_ids = set()
         self.lock = threading.Lock()
+        
+        # Delta crawling - track what we've seen before to skip duplicate work
+        self.job_cache_file = 'job_cache.json'
+        self.last_scraped_jobs = self.load_previous_job_cache()
         
         # Session-based progress tracking
         self.total_jobs_found = 0
@@ -135,7 +139,7 @@ class MultiAccountJobRightScraper:
             self.current_account = account['name']
             
             # Method 1: Try pagination approach with enhanced tracking
-            jobs.extend(self.scrape_with_pagination_enhanced(session, account, target_jobs_per_account, keyword))
+            jobs.extend(self.scrape_with_pagination_enhanced(session, account, target_jobs_per_account, keyword, max_pages_per_account=20))
 
             # Method 2: Try job title filtering if configured and keyword matches
             if len(jobs) < target_jobs_per_account and account.get('job_title') and keyword:
@@ -167,15 +171,29 @@ class MultiAccountJobRightScraper:
             self.log_to_session(f"❌ {account['name']} enhanced scraping error: {e}", 'error')
             return []
     
-    def scrape_with_pagination_enhanced(self, session, account, target_jobs, keyword=""):
-        """Enhanced pagination with keyword awareness"""
+    def scrape_with_pagination_enhanced(self, session, account, target_jobs, keyword="", max_pages_per_account=15):
+        """Enhanced pagination with deep scraping and keyword awareness"""
         jobs = []
-        max_pages = min((target_jobs // 20) + 1, 3)
+        # More aggressive pagination - scrape deeper pages for better results
+        # Default to 15 pages per account (up to 300 jobs per account)
+        max_pages = min(max_pages_per_account, max((target_jobs // 15), 15))
+        
+        # API Discovery Enhancement: Use different sort conditions for diversity
+        # Discovered sort conditions: 0,1,2,3,4,5 all work and provide different orderings
+        sort_conditions = [0, 1, 2, 3, 4, 5]  # Different job sorting algorithms
+        pages_per_sort = max(1, max_pages // len(sort_conditions))  # Distribute pages across sort conditions
 
         for page in range(max_pages):
             try:
                 position = page * 20
+                
+                # API Discovery: Use rotating sort conditions for diversity
+                current_sort = sort_conditions[page % len(sort_conditions)]
+                self.log_to_session(f"🔄 {account['name']}: Using sortCondition={current_sort} on page {page+1}", 'info')
+                
                 params = {"position": position} if position > 0 else {}
+                # Add discovered sortCondition parameter for better diversity
+                params["sortCondition"] = current_sort
 
                 response = session.get(
                     "https://jobright.ai/swan/recommend/landing/jobs",
@@ -189,17 +207,25 @@ class MultiAccountJobRightScraper:
                         job_list = data['result']['jobList']
                         page_jobs = self.process_job_list(job_list, page + 1)
                         
-                        # Pre-filter for keyword if provided
+                        # Pre-filter for keyword if provided to improve efficiency
                         if keyword:
                             keyword_jobs = [job for job in page_jobs if self.job_matches_keyword(job, keyword)]
                             if keyword_jobs:
                                 self.log_to_session(f"🎯 {account['name']}: Page {page+1} - {len(keyword_jobs)}/{len(page_jobs)} jobs match '{keyword}'", 'info')
+                            # Only add matching jobs if keyword filter is active for immediate efficiency
+                            jobs.extend(keyword_jobs)
+                        else:
+                            jobs.extend(page_jobs)
                         
-                        jobs.extend(page_jobs)
-
+                        # Stop if we hit our target for this account, or if no more jobs found
+                        if len(job_list) < 20:  # Less than full page indicates end of results
+                            self.log_to_session(f"📄 {account['name']}: Reached end of available jobs at page {page+1}", 'info')
+                            break
                         if len(jobs) >= target_jobs:
                             break
                     else:
+                        # No jobs found on this page, likely end of results
+                        self.log_to_session(f"📄 {account['name']}: No more jobs available after page {page}", 'info')
                         break
                 else:
                     break
@@ -213,51 +239,139 @@ class MultiAccountJobRightScraper:
         return jobs
     
     def job_matches_keyword(self, job, keyword):
-        """Check if a job matches the keyword"""
+        """Very flexible keyword matching using only available API fields"""
         if not keyword:
             return True
         
-        keyword_lower = keyword.lower()
-        title = str(job.get('job_title', '')).lower()
-        summary = str(job.get('job_summary', '')).lower()
-        responsibilities = str(job.get('core_responsibilities', '')).lower()
+        # Only use fields that actually exist in JobRight API response
+        searchable_fields = [
+            job.get('job_title', ''),
+            job.get('job_summary', ''),
+            job.get('core_responsibilities', ''),
+            job.get('company', ''),
+            job.get('seniority', ''),
+            job.get('employment_type', ''),
+            job.get('work_model', ''),
+            job.get('location', ''),
+            job.get('salary', ''),
+            job.get('publish_desc', '')
+        ]
         
-        return (keyword_lower in title or 
-                keyword_lower in summary or 
-                keyword_lower in responsibilities)
+        # Combine all text into one searchable string
+        combined_text = ' '.join([str(field) for field in searchable_fields if field and str(field).lower() != 'none']).lower()
+        
+        # Handle multiple keywords (comma-separated) 
+        keyword_variants = [kw.strip().lower() for kw in keyword.split(',') if kw.strip()]
+        
+        # Very flexible matching - try multiple approaches
+        for kw in keyword_variants:
+            # 1. Direct substring match (most common)
+            if kw in combined_text:
+                return True
+                
+            # 2. Check each individual field for more precise matching
+            for field in searchable_fields:
+                field_text = str(field).lower() if field else ''
+                if field_text and kw in field_text:
+                    return True
+                    
+            # 3. Word-based partial matching (very lenient)
+            words_in_text = combined_text.split()
+            for word in words_in_text:
+                # Match if keyword is part of any word, or word is part of keyword
+                if len(kw) > 1 and len(word) > 1:
+                    if kw in word or word in kw:
+                        return True
+                        
+            # 4. Multi-word keyword matching 
+            if ' ' in kw:
+                kw_words = kw.split()
+                # Check if most words from the keyword are present (80% match)
+                matches = sum(1 for kw_word in kw_words if any(kw_word in text_word for text_word in words_in_text))
+                if matches >= len(kw_words) * 0.8:  # 80% of words must match
+                    return True
+                    
+            # 5. Very lenient single-character matching for short keywords  
+            if len(kw) <= 3 and kw in combined_text:
+                return True
+        
+        return False
     
     def filter_jobs_by_keyword_enhanced(self, all_jobs, keyword=""):
-        """Enhanced keyword filtering with better tracking"""
+        """Enhanced keyword filtering with comprehensive matching and detailed tracking"""
         if not keyword:
+            # Add tracking info for all jobs when no keyword filter
+            for job in all_jobs:
+                job['keyword_match'] = 'No filter applied'
+                job['keyword_score'] = 1
             return all_jobs
 
         self.log_to_session(f"🎯 Filtering {len(all_jobs)} jobs for keyword: '{keyword}'", 'info')
 
-        keyword_lower = keyword.lower()
         filtered_jobs = []
         keyword_variants = [kw.strip().lower() for kw in keyword.split(',') if kw.strip()]
 
         for job in all_jobs:
-            title = str(job.get('job_title', '')).lower()
-            summary = str(job.get('job_summary', '')).lower()
-            responsibilities = str(job.get('core_responsibilities', '')).lower()
-            
-            # Check for any keyword variant
-            matched_keywords = []
-            for kw in keyword_variants:
-                if (kw in title or kw in summary or kw in responsibilities):
-                    matched_keywords.append(kw)
-            
-            if matched_keywords:
-                job['keyword_match'] = f'Matches: {", ".join(matched_keywords)}'
-                job['keyword_score'] = len(matched_keywords)
+            # Use the enhanced matching function
+            if self.job_matches_keyword(job, keyword):
+                # Determine which fields matched for better tracking
+                matched_info = self._get_match_details(job, keyword_variants)
+                job['keyword_match'] = matched_info['match_text']
+                job['keyword_score'] = matched_info['match_score']
+                job['match_fields'] = matched_info['matched_fields']
                 filtered_jobs.append(job)
             else:
                 job['keyword_match'] = 'No match'
                 job['keyword_score'] = 0
+                job['match_fields'] = []
 
-        self.log_to_session(f"✅ Found {len(filtered_jobs)} jobs matching '{keyword}'", 'success')
+        self.log_to_session(f"✅ Found {len(filtered_jobs)} jobs matching '{keyword}' (improved from {len(all_jobs)} total)", 'success')
+        
+        # Log breakdown of matches by field type for better insights
+        if filtered_jobs:
+            field_matches = {}
+            for job in filtered_jobs:
+                for field in job.get('match_fields', []):
+                    field_matches[field] = field_matches.get(field, 0) + 1
+            
+            match_summary = ', '.join([f"{field}: {count}" for field, count in field_matches.items()])
+            self.log_to_session(f"📊 Match breakdown: {match_summary}", 'info')
+        
         return filtered_jobs
+    
+    def _get_match_details(self, job, keyword_variants):
+        """Get detailed information about which fields matched which keywords"""
+        matched_keywords = []
+        matched_fields = []
+        
+        # Define field mapping for better organization (only actual API fields)
+        field_mapping = {
+            'job_title': 'Title',
+            'job_summary': 'Summary', 
+            'core_responsibilities': 'Responsibilities',
+            'company': 'Company',
+            'seniority': 'Level',
+            'employment_type': 'Type',
+            'work_model': 'Work Style',
+            'location': 'Location',
+            'salary': 'Salary',
+            'publish_desc': 'Description'
+        }
+        
+        for kw in keyword_variants:
+            for field_key, field_display in field_mapping.items():
+                field_value = str(job.get(field_key, '')).lower()
+                if field_value and field_value != 'none' and kw in field_value:
+                    if kw not in matched_keywords:
+                        matched_keywords.append(kw)
+                    if field_display not in matched_fields:
+                        matched_fields.append(field_display)
+        
+        return {
+            'match_text': f'Matches: {", ".join(matched_keywords)}',
+            'match_score': len(matched_keywords),
+            'matched_fields': matched_fields
+        }
         
     def incremental_sheet_update(self, jobs, account_name):
         """Incrementally update Google Sheets after each account completion"""
@@ -277,6 +391,31 @@ class MultiAccountJobRightScraper:
             self.log_to_session(f"❌ Sheet update error for {account_name}: {e}", 'error')
             return None
 
+    def load_previous_job_cache(self):
+        """Load previously scraped job IDs to implement delta crawling"""
+        try:
+            if os.path.exists(self.job_cache_file):
+                with open(self.job_cache_file, 'r') as f:
+                    cache_data = json.load(f)
+                    return set(cache_data.get('job_ids', []))
+        except Exception as e:
+            logger.info(f"No previous cache found or error loading: {e}")
+        return set()
+    
+    def save_job_cache(self, new_job_ids):
+        """Save scraped job IDs for future delta crawling"""
+        try:
+            cache_data = {
+                'job_ids': list(self.last_scraped_jobs.union(new_job_ids)),
+                'last_updated': datetime.now().isoformat(),
+                'total_jobs_cached': len(self.last_scraped_jobs) + len(new_job_ids)
+            }
+            with open(self.job_cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            logger.info(f"✅ Cached {len(new_job_ids)} new job IDs for delta crawling")
+        except Exception as e:
+            logger.warning(f"Failed to save job cache: {e}")
+    
     def load_accounts_config(self):
         """Load accounts configuration from JSON file"""
         try:
@@ -441,15 +580,26 @@ class MultiAccountJobRightScraper:
             logger.error(f"❌ {account['name']} scraping error: {e}")
             return []
 
-    def scrape_with_pagination(self, session, account, target_jobs):
-        """Scrape using pagination approach"""
+    def scrape_with_pagination(self, session, account, target_jobs, max_pages_per_account=10):
+        """Scrape using pagination approach with configurable depth"""
         jobs = []
-        max_pages = min((target_jobs // 20) + 1, 3)  # Max 3 pages per account
+        # Improved pagination depth - default to 10 pages per account  
+        max_pages = min(max_pages_per_account, max((target_jobs // 15), 8))
+        
+        # API Discovery Enhancement: Use different sort conditions for diversity
+        sort_conditions = [0, 1, 2, 3, 4, 5]  # Different job sorting algorithms
 
         for page in range(max_pages):
             try:
                 position = page * 20
+                
+                # API Discovery: Use rotating sort conditions for diversity
+                current_sort = sort_conditions[page % len(sort_conditions)]
+                self.log_to_session(f"🔄 {account['name']}: Using sortCondition={current_sort} on page {page+1}", 'info')
+                
                 params = {"position": position} if position > 0 else {}
+                # Add discovered sortCondition parameter for better diversity
+                params["sortCondition"] = current_sort
 
                 response = session.get(
                     "https://jobright.ai/swan/recommend/landing/jobs",
@@ -605,7 +755,7 @@ class MultiAccountJobRightScraper:
 
         return processed_jobs
 
-    def run_multi_account_scraper(self, target_total_jobs=2000, max_concurrent_accounts=20, keyword=""):
+    def run_multi_account_scraper(self, target_total_jobs=2000, max_concurrent_accounts=80, keyword=""):
         """Enhanced multi-account scraper with session tracking and intelligent features"""
         self.log_to_session(f"🚀 ENHANCED MULTI-ACCOUNT JOBRIGHT SCRAPER STARTING", 'success')
         self.log_to_session(f"🎯 Target: {target_total_jobs} jobs using up to {max_concurrent_accounts} concurrent accounts", 'info')
@@ -615,9 +765,17 @@ class MultiAccountJobRightScraper:
         # Prioritize accounts based on keyword
         prioritized_accounts = self.prioritize_accounts(keyword)
         
-        # Limit concurrent accounts to available accounts
-        max_concurrent_accounts = min(max_concurrent_accounts, len(prioritized_accounts))
-        target_jobs_per_account = max(target_total_jobs // max_concurrent_accounts, 25)
+        # Use all available accounts up to the max_concurrent_accounts limit
+        accounts_to_use = min(max_concurrent_accounts, len(prioritized_accounts))
+        # Ensure we use at least the minimum viable accounts for the target
+        if target_total_jobs > 50 and accounts_to_use < 5:
+            accounts_to_use = min(5, len(prioritized_accounts))
+        if target_total_jobs > 200 and accounts_to_use < 15:
+            accounts_to_use = min(15, len(prioritized_accounts))
+        if target_total_jobs > 500 and accounts_to_use < 30:
+            accounts_to_use = min(30, len(prioritized_accounts))
+            
+        target_jobs_per_account = max(target_total_jobs // accounts_to_use, 25)
 
         all_jobs = []
         successful_accounts = 0
@@ -633,15 +791,15 @@ class MultiAccountJobRightScraper:
         }, 'Creating account sessions...')
 
         # Create sessions for priority accounts first
-        self.log_to_session(f"🔐 Creating sessions for {max_concurrent_accounts} prioritized accounts...", 'info')
+        self.log_to_session(f"🔐 Creating sessions for {accounts_to_use} prioritized accounts...", 'info')
         active_accounts = []
 
-        for i, account in enumerate(prioritized_accounts[:max_concurrent_accounts]):
+        for i, account in enumerate(prioritized_accounts[:accounts_to_use]):
             self.current_account = account['name']
             self.update_session_progress(
-                5 + (i * 15 / max_concurrent_accounts), 
+                5 + (i * 15 / accounts_to_use), 
                 {'current_account': f"Setting up {account['name']}..."},
-                f'Creating session {i+1}/{max_concurrent_accounts}...'
+                f'Creating session {i+1}/{accounts_to_use}...'
             )
             
             session = self.create_session(account)
@@ -654,7 +812,7 @@ class MultiAccountJobRightScraper:
                 self.log_to_session(f"❌ {account['name']} session failed", 'error')
 
             # Add delay between session creations to avoid rate limiting
-            if i < max_concurrent_accounts - 1:
+            if i < accounts_to_use - 1:
                 time.sleep(1)
 
         self.log_to_session(f"✅ Active sessions: {successful_accounts}, Failed: {failed_accounts}", 'success')
@@ -914,13 +1072,13 @@ class MultiAccountJobRightScraper:
                     max_concurrent_accounts = min(max_concurrent_accounts, 8)
                     self.log_to_session(f"🧠 Hybrid Mode: Using {max_concurrent_accounts} accounts for {target_jobs} jobs (aggressive)", 'info')
                 else:
-                    max_concurrent_accounts = min(max_concurrent_accounts, 15)
+                    max_concurrent_accounts = min(max_concurrent_accounts, 80)
                     self.log_to_session(f"🧠 Hybrid Mode: Using {max_concurrent_accounts} accounts for {target_jobs} jobs (maximum)", 'info')
             elif scrape_mode == 'conservative':
                 max_concurrent_accounts = min(max_concurrent_accounts, 5)
                 self.log_to_session(f"🐌 Conservative Mode: Limited to {max_concurrent_accounts} accounts", 'info')
             elif scrape_mode == 'aggressive':
-                max_concurrent_accounts = min(max_concurrent_accounts, 20)
+                max_concurrent_accounts = min(max_concurrent_accounts, 80)
                 self.log_to_session(f"⚡ Aggressive Mode: Using up to {max_concurrent_accounts} accounts", 'info')
 
             # Update initial progress
