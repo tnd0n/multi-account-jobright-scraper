@@ -1,0 +1,29 @@
+{
+  "accounts": [
+    {
+      "email": "your-account1@example.com",
+      "password": "your-secure-password-1",
+      "name": "Account_1",
+      "job_title": "Software Engineer",
+      "active": true,
+      "max_daily_requests": 100
+    },
+    {
+      "email": "your-account2@example.com",
+      "password": "your-secure-password-2",
+      "name": "Account_2",
+      "job_title": "Data Scientist",
+      "active": true,
+      "max_daily_requests": 100
+    },
+    {
+      "email": "your-account3@example.com",
+      "password": "your-secure-password-3",
+      "name": "Account_3",
+      "job_title": "Frontend Developer",
+      "active": true,
+      "max_daily_requests": 100
+    }
+  ],
+  "_comment": "Add more accounts as needed. Keep this as example only - real credentials should be in environment variables or secure storage."
+}
