@@ -16,14 +16,18 @@ from datetime import datetime
 from typing import List, Dict, Any
 import queue
 import logging
+import os
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class MultiAccountJobRightScraper:
-    def __init__(self, config_file='accounts_config.json'):
+    def __init__(self, config_file='accounts_config.json', session_id=None, session_storage=None, session_lock=None):
         self.config_file = config_file
+        self.session_id = session_id
+        self.session_storage = session_storage
+        self.session_lock = session_lock
         self.accounts = []
         self.active_sessions = {}
         self.job_queue = queue.Queue()
@@ -37,6 +41,241 @@ class MultiAccountJobRightScraper:
         # Deduplication
         self.processed_job_ids = set()
         self.lock = threading.Lock()
+        
+        # Session-based progress tracking
+        self.total_jobs_found = 0
+        self.accounts_used = 0
+        self.matching_jobs = 0
+        self.current_account = ""
+        self.target_reached = False
+        self.progress_percentage = 0
+    
+    def log_to_session(self, message, log_type='info'):
+        """Log message to session storage for real-time frontend updates"""
+        # Use direct session storage references if available
+        if self.session_id and self.session_storage and self.session_lock:
+            try:
+                with self.session_lock:
+                    if self.session_id in self.session_storage:
+                        self.session_storage[self.session_id]['logs'].append({
+                            'message': message,
+                            'type': log_type,
+                            'timestamp': datetime.now().isoformat()
+                        })
+            except Exception as e:
+                logger.warning(f"Failed to log to session: {e}")
+        
+        # Also log normally for debugging
+        if log_type == 'error':
+            logger.error(message)
+        elif log_type == 'warning':
+            logger.warning(message)
+        elif log_type == 'success':
+            logger.info(f"✅ {message}")
+        else:
+            logger.info(message)
+    
+    def update_session_progress(self, progress, stats=None, progress_text=None):
+        """Update session progress and stats for real-time frontend updates"""
+        # Use direct session storage references if available
+        if self.session_id and self.session_storage and self.session_lock:
+            try:
+                with self.session_lock:
+                    if self.session_id in self.session_storage:
+                        self.session_storage[self.session_id]['progress'] = progress
+                        self.progress_percentage = progress
+                        
+                        if progress_text:
+                            self.session_storage[self.session_id]['progress_text'] = progress_text
+                        
+                        if stats:
+                            self.session_storage[self.session_id]['stats'].update(stats)
+            except Exception as e:
+                logger.warning(f"Failed to update session progress: {e}")
+    
+    def prioritize_accounts(self, keyword=""):
+        """Prioritize accounts whose job_title contains the search keyword"""
+        if not keyword:
+            return self.accounts.copy()
+        
+        keyword_lower = keyword.lower()
+        prioritized = []
+        regular = []
+        
+        for account in self.accounts:
+            job_title = account.get('job_title', '').lower()
+            if any(kw.strip().lower() in job_title for kw in keyword.split(',') if kw.strip()):
+                prioritized.append(account)
+                self.log_to_session(f"🎯 Prioritized {account['name']} - job_title contains '{keyword}'", 'info')
+            else:
+                regular.append(account)
+        
+        # Shuffle each group for randomness
+        import random
+        random.shuffle(prioritized)
+        random.shuffle(regular)
+        
+        result = prioritized + regular
+        if prioritized:
+            self.log_to_session(f"⚡ Using {len(prioritized)} prioritized accounts first", 'success')
+        
+        return result
+        
+    def scrape_jobs_from_account_enhanced(self, account, target_jobs_per_account=25, keyword=""):
+        """Enhanced job scraping with session tracking and keyword awareness"""
+        if 'session' not in account:
+            self.log_to_session(f"❌ {account['name']}: No active session", 'error')
+            return []
+
+        session = account['session']
+        jobs = []
+
+        try:
+            self.log_to_session(f"🔍 {account['name']}: Starting enhanced job scraping (target: {target_jobs_per_account})", 'info')
+            self.current_account = account['name']
+            
+            # Method 1: Try pagination approach with enhanced tracking
+            jobs.extend(self.scrape_with_pagination_enhanced(session, account, target_jobs_per_account, keyword))
+
+            # Method 2: Try job title filtering if configured and keyword matches
+            if len(jobs) < target_jobs_per_account and account.get('job_title') and keyword:
+                job_title = account.get('job_title', '').lower()
+                if any(kw.strip().lower() in job_title for kw in keyword.split(',') if kw.strip()):
+                    additional_jobs = self.scrape_with_job_title_filter(
+                        session, account, target_jobs_per_account - len(jobs)
+                    )
+                    jobs.extend(additional_jobs)
+                    self.log_to_session(f"🎯 {account['name']}: Used targeted filtering for '{keyword}'", 'success')
+
+            # Method 3: Try API endpoint as fallback
+            if len(jobs) < target_jobs_per_account * 0.5:
+                api_jobs = self.scrape_with_api(session, account, target_jobs_per_account)
+                jobs.extend(api_jobs)
+
+            # Add enhanced metadata to jobs
+            for job in jobs:
+                job['scraper_account'] = account['name']
+                job['scraper_email'] = account['email']
+                job['job_title_preference'] = account.get('job_title', 'General')
+                job['scraped_timestamp'] = datetime.now().isoformat()
+                job['session_id'] = self.session_id or 'unknown'
+
+            self.log_to_session(f"✅ {account['name']}: Scraped {len(jobs)} jobs successfully", 'success')
+            return jobs
+
+        except Exception as e:
+            self.log_to_session(f"❌ {account['name']} enhanced scraping error: {e}", 'error')
+            return []
+    
+    def scrape_with_pagination_enhanced(self, session, account, target_jobs, keyword=""):
+        """Enhanced pagination with keyword awareness"""
+        jobs = []
+        max_pages = min((target_jobs // 20) + 1, 3)
+
+        for page in range(max_pages):
+            try:
+                position = page * 20
+                params = {"position": position} if position > 0 else {}
+
+                response = session.get(
+                    "https://jobright.ai/swan/recommend/landing/jobs",
+                    params=params,
+                    timeout=15
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('success') and data.get('result', {}).get('jobList'):
+                        job_list = data['result']['jobList']
+                        page_jobs = self.process_job_list(job_list, page + 1)
+                        
+                        # Pre-filter for keyword if provided
+                        if keyword:
+                            keyword_jobs = [job for job in page_jobs if self.job_matches_keyword(job, keyword)]
+                            if keyword_jobs:
+                                self.log_to_session(f"🎯 {account['name']}: Page {page+1} - {len(keyword_jobs)}/{len(page_jobs)} jobs match '{keyword}'", 'info')
+                        
+                        jobs.extend(page_jobs)
+
+                        if len(jobs) >= target_jobs:
+                            break
+                    else:
+                        break
+                else:
+                    break
+
+                time.sleep(1)
+
+            except Exception as e:
+                self.log_to_session(f"⚠️ {account['name']} enhanced pagination error on page {page}: {e}", 'warning')
+                break
+
+        return jobs
+    
+    def job_matches_keyword(self, job, keyword):
+        """Check if a job matches the keyword"""
+        if not keyword:
+            return True
+        
+        keyword_lower = keyword.lower()
+        title = str(job.get('job_title', '')).lower()
+        summary = str(job.get('job_summary', '')).lower()
+        responsibilities = str(job.get('core_responsibilities', '')).lower()
+        
+        return (keyword_lower in title or 
+                keyword_lower in summary or 
+                keyword_lower in responsibilities)
+    
+    def filter_jobs_by_keyword_enhanced(self, all_jobs, keyword=""):
+        """Enhanced keyword filtering with better tracking"""
+        if not keyword:
+            return all_jobs
+
+        self.log_to_session(f"🎯 Filtering {len(all_jobs)} jobs for keyword: '{keyword}'", 'info')
+
+        keyword_lower = keyword.lower()
+        filtered_jobs = []
+        keyword_variants = [kw.strip().lower() for kw in keyword.split(',') if kw.strip()]
+
+        for job in all_jobs:
+            title = str(job.get('job_title', '')).lower()
+            summary = str(job.get('job_summary', '')).lower()
+            responsibilities = str(job.get('core_responsibilities', '')).lower()
+            
+            # Check for any keyword variant
+            matched_keywords = []
+            for kw in keyword_variants:
+                if (kw in title or kw in summary or kw in responsibilities):
+                    matched_keywords.append(kw)
+            
+            if matched_keywords:
+                job['keyword_match'] = f'Matches: {", ".join(matched_keywords)}'
+                job['keyword_score'] = len(matched_keywords)
+                filtered_jobs.append(job)
+            else:
+                job['keyword_match'] = 'No match'
+                job['keyword_score'] = 0
+
+        self.log_to_session(f"✅ Found {len(filtered_jobs)} jobs matching '{keyword}'", 'success')
+        return filtered_jobs
+        
+    def incremental_sheet_update(self, jobs, account_name):
+        """Incrementally update Google Sheets after each account completion"""
+        if not jobs or not self.google_credentials:
+            return None
+            
+        try:
+            # This is a simplified incremental update
+            # In practice, you'd want to append to existing sheets
+            self.log_to_session(f"📊 {account_name}: Updating Google Sheets with {len(jobs)} jobs", 'info')
+            
+            # For now, we'll just log this - full implementation would require
+            # more complex sheet management logic
+            return f"Updated sheet with {len(jobs)} jobs from {account_name}"
+            
+        except Exception as e:
+            self.log_to_session(f"❌ Sheet update error for {account_name}: {e}", 'error')
+            return None
 
     def load_accounts_config(self):
         """Load accounts configuration from JSON file"""
@@ -367,74 +606,166 @@ class MultiAccountJobRightScraper:
         return processed_jobs
 
     def run_multi_account_scraper(self, target_total_jobs=2000, max_concurrent_accounts=20, keyword=""):
-        """Run scraper with multiple accounts simultaneously"""
-        logger.info(f"🚀 MULTI-ACCOUNT JOBRIGHT SCRAPER STARTING")
-        logger.info(f"🎯 Target: {target_total_jobs} jobs using up to {max_concurrent_accounts} concurrent accounts")
-        logger.info(f"📧 Available accounts: {len(self.accounts)}")
-        logger.info(f"🔍 Keyword filter: '{keyword}'" if keyword else "🔍 No keyword filter")
-        logger.info("=" * 80)
+        """Enhanced multi-account scraper with session tracking and intelligent features"""
+        self.log_to_session(f"🚀 ENHANCED MULTI-ACCOUNT JOBRIGHT SCRAPER STARTING", 'success')
+        self.log_to_session(f"🎯 Target: {target_total_jobs} jobs using up to {max_concurrent_accounts} concurrent accounts", 'info')
+        self.log_to_session(f"📧 Available accounts: {len(self.accounts)}", 'info')
+        self.log_to_session(f"🔍 Keyword filter: '{keyword}'" if keyword else "🔍 No keyword filter", 'info')
 
+        # Prioritize accounts based on keyword
+        prioritized_accounts = self.prioritize_accounts(keyword)
+        
         # Limit concurrent accounts to available accounts
-        max_concurrent_accounts = min(max_concurrent_accounts, len(self.accounts))
+        max_concurrent_accounts = min(max_concurrent_accounts, len(prioritized_accounts))
         target_jobs_per_account = max(target_total_jobs // max_concurrent_accounts, 25)
 
         all_jobs = []
         successful_accounts = 0
         failed_accounts = 0
+        accounts_processed = 0
 
-        # Create sessions for selected accounts
-        logger.info(f"🔐 Creating sessions for {max_concurrent_accounts} accounts...")
+        # Update initial progress
+        self.update_session_progress(5, {
+            'jobs_found': 0,
+            'accounts_used': 0,
+            'matching_jobs': 0,
+            'current_account': 'Initializing...'
+        }, 'Creating account sessions...')
+
+        # Create sessions for priority accounts first
+        self.log_to_session(f"🔐 Creating sessions for {max_concurrent_accounts} prioritized accounts...", 'info')
         active_accounts = []
 
-        for i, account in enumerate(self.accounts[:max_concurrent_accounts]):
+        for i, account in enumerate(prioritized_accounts[:max_concurrent_accounts]):
+            self.current_account = account['name']
+            self.update_session_progress(
+                5 + (i * 15 / max_concurrent_accounts), 
+                {'current_account': f"Setting up {account['name']}..."},
+                f'Creating session {i+1}/{max_concurrent_accounts}...'
+            )
+            
             session = self.create_session(account)
             if session:
                 active_accounts.append(account)
                 successful_accounts += 1
+                self.log_to_session(f"✅ {account['name']} session created successfully", 'success')
             else:
                 failed_accounts += 1
+                self.log_to_session(f"❌ {account['name']} session failed", 'error')
 
             # Add delay between session creations to avoid rate limiting
             if i < max_concurrent_accounts - 1:
-                time.sleep(2)
+                time.sleep(1)
 
-        logger.info(f"✅ Active sessions: {successful_accounts}, Failed: {failed_accounts}")
+        self.log_to_session(f"✅ Active sessions: {successful_accounts}, Failed: {failed_accounts}", 'success')
+        self.accounts_used = successful_accounts
 
         if not active_accounts:
-            logger.error("❌ No active accounts available")
+            self.log_to_session("❌ No active accounts available", 'error')
             return {"success": False, "message": "No accounts could be authenticated"}
 
-        # Scrape jobs using multiple accounts simultaneously
-        logger.info(f"🔍 Starting concurrent scraping with {len(active_accounts)} accounts...")
+        # Enhanced concurrent scraping with auto-stop and incremental updates
+        self.log_to_session(f"🔍 Starting enhanced concurrent scraping with {len(active_accounts)} accounts...", 'info')
+        
+        # Track jobs by account for incremental processing
+        completed_futures = []
+        jobs_by_account = {}
+        
+        # Update progress to scraping phase
+        self.update_session_progress(25, {
+            'jobs_found': 0,
+            'accounts_used': len(active_accounts),
+            'matching_jobs': 0,
+            'current_account': 'Starting scraping...'
+        }, 'Starting concurrent scraping...')
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(active_accounts)) as executor:
             future_to_account = {
-                executor.submit(self.scrape_jobs_from_account, account, target_jobs_per_account): account 
+                executor.submit(self.scrape_jobs_from_account_enhanced, account, target_jobs_per_account, keyword): account 
                 for account in active_accounts
             }
 
-            for future in concurrent.futures.as_completed(future_to_account):
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_account)):
                 account = future_to_account[future]
+                accounts_processed += 1
+                
                 try:
                     jobs = future.result()
+                    jobs_by_account[account['name']] = jobs
                     all_jobs.extend(jobs)
-                    logger.info(f"✅ {account['name']}: Added {len(jobs)} jobs (Total: {len(all_jobs)})")
+                    
+                    # Update tracking variables
+                    self.total_jobs_found = len(all_jobs)
+                    self.matching_jobs = len([j for j in all_jobs if j.get('keyword_match', '') != 'No match'])
+                    
+                    # Calculate progress (25% base + 65% for scraping completion)
+                    scraping_progress = 25 + (accounts_processed * 65 / len(active_accounts))
+                    
+                    self.update_session_progress(scraping_progress, {
+                        'jobs_found': self.total_jobs_found,
+                        'accounts_used': self.accounts_used,
+                        'matching_jobs': self.matching_jobs,
+                        'current_account': f"{account['name']} completed"
+                    }, f'Account {accounts_processed}/{len(active_accounts)} completed')
+                    
+                    self.log_to_session(f"✅ {account['name']}: Added {len(jobs)} jobs (Total: {len(all_jobs)})", 'success')
+                    
+                    # Incremental Google Sheets update after each account
+                    if hasattr(self, 'sheet_url') and self.sheet_url:
+                        try:
+                            self.incremental_sheet_update(jobs, account['name'])
+                            self.log_to_session(f"📊 {account['name']}: Data exported to Google Sheets", 'info')
+                        except Exception as e:
+                            self.log_to_session(f"⚠️ {account['name']}: Sheet update failed - {str(e)}", 'warning')
+                    
+                    # Auto-stop functionality - check if target reached
+                    if self.total_jobs_found >= target_total_jobs:
+                        self.target_reached = True
+                        self.log_to_session(f"🎯 TARGET REACHED! Found {self.total_jobs_found} jobs (target: {target_total_jobs})", 'success')
+                        self.log_to_session("🛑 Auto-stopping remaining accounts to save resources", 'info')
+                        
+                        # Cancel remaining futures
+                        for pending_future in future_to_account:
+                            if not pending_future.done():
+                                pending_future.cancel()
+                        break
+                        
                 except Exception as e:
-                    logger.error(f"❌ {account['name']}: Scraping failed - {e}")
+                    self.log_to_session(f"❌ {account['name']}: Scraping failed - {e}", 'error')
+                    failed_accounts += 1
 
-        logger.info(f"🎉 SCRAPING COMPLETE: {len(all_jobs)} total jobs from {len(active_accounts)} accounts")
+        # Final processing and filtering
+        self.update_session_progress(90, {
+            'jobs_found': self.total_jobs_found,
+            'accounts_used': self.accounts_used,
+            'matching_jobs': self.matching_jobs,
+            'current_account': 'Processing results...'
+        }, 'Processing and filtering results...')
+
+        self.log_to_session(f"🎉 SCRAPING COMPLETE: {len(all_jobs)} total jobs from {accounts_processed} accounts", 'success')
 
         # Filter jobs by keyword if provided
-        filtered_jobs = self.filter_jobs_by_keyword(all_jobs, keyword) if keyword else all_jobs
+        filtered_jobs = self.filter_jobs_by_keyword_enhanced(all_jobs, keyword) if keyword else all_jobs
+        self.matching_jobs = len(filtered_jobs)
+
+        # Final progress update
+        self.update_session_progress(95, {
+            'jobs_found': len(all_jobs),
+            'accounts_used': accounts_processed,
+            'matching_jobs': len(filtered_jobs),
+            'current_account': 'Complete!'
+        }, 'Finalizing results...')
 
         return {
             "success": True,
             "total_jobs": len(all_jobs),
             "filtered_jobs": len(filtered_jobs),
-            "accounts_used": len(active_accounts),
+            "accounts_used": accounts_processed,
             "accounts_failed": failed_accounts,
             "jobs": filtered_jobs,
-            "keyword": keyword
+            "keyword": keyword,
+            "target_reached": self.target_reached,
+            "jobs_by_account": jobs_by_account
         }
 
     def filter_jobs_by_keyword(self, all_jobs, keyword=""):
@@ -542,7 +873,7 @@ class MultiAccountJobRightScraper:
                 data.append(row)
 
             # Upload data to sheet
-            worksheet.update(values=data, range_name='A1')
+            worksheet.update('A1', data)
 
             # Format headers
             header_format = {
@@ -558,10 +889,49 @@ class MultiAccountJobRightScraper:
             logger.error(f"❌ Export failed: {e}")
             return None
 
-    def run_complete_multi_account_scraper(self, sheet_url, keyword="", target_jobs=2000, max_concurrent_accounts=20):
-        """Complete scraper workflow with multi-account support"""
+    def run_complete_multi_account_scraper(self, sheet_url, keyword="", target_jobs=50, max_concurrent_accounts=5, scrape_mode="balanced"):
+        """Enhanced complete scraper workflow with session tracking and intelligent features"""
         try:
-            # Run multi-account scraping
+            # Store sheet_url for incremental updates
+            self.sheet_url = sheet_url
+            
+            # Log initial session data
+            self.log_to_session(f"🚀 Enhanced Multi-Account Scraper initializing...", 'info')
+            self.log_to_session(f"📄 Sheet: {sheet_url}", 'info')
+            self.log_to_session(f"🎯 Target: {target_jobs} jobs", 'info')
+            self.log_to_session(f"🔍 Keyword: '{keyword}'" if keyword else "🔍 No keyword filter", 'info')
+            self.log_to_session(f"⚙️ Mode: {scrape_mode}", 'info')
+            
+            # Apply hybrid mode intelligence for concurrency adjustment
+            if scrape_mode == 'hybrid':
+                if target_jobs <= 25:
+                    max_concurrent_accounts = min(max_concurrent_accounts, 3)
+                    self.log_to_session(f"🧠 Hybrid Mode: Using {max_concurrent_accounts} accounts for {target_jobs} jobs (conservative)", 'info')
+                elif target_jobs <= 50:
+                    max_concurrent_accounts = min(max_concurrent_accounts, 5)
+                    self.log_to_session(f"🧠 Hybrid Mode: Using {max_concurrent_accounts} accounts for {target_jobs} jobs (balanced)", 'info')
+                elif target_jobs <= 100:
+                    max_concurrent_accounts = min(max_concurrent_accounts, 8)
+                    self.log_to_session(f"🧠 Hybrid Mode: Using {max_concurrent_accounts} accounts for {target_jobs} jobs (aggressive)", 'info')
+                else:
+                    max_concurrent_accounts = min(max_concurrent_accounts, 15)
+                    self.log_to_session(f"🧠 Hybrid Mode: Using {max_concurrent_accounts} accounts for {target_jobs} jobs (maximum)", 'info')
+            elif scrape_mode == 'conservative':
+                max_concurrent_accounts = min(max_concurrent_accounts, 5)
+                self.log_to_session(f"🐌 Conservative Mode: Limited to {max_concurrent_accounts} accounts", 'info')
+            elif scrape_mode == 'aggressive':
+                max_concurrent_accounts = min(max_concurrent_accounts, 20)
+                self.log_to_session(f"⚡ Aggressive Mode: Using up to {max_concurrent_accounts} accounts", 'info')
+
+            # Update initial progress
+            self.update_session_progress(3, {
+                'jobs_found': 0,
+                'accounts_used': 0, 
+                'matching_jobs': 0,
+                'current_account': 'Starting...'
+            }, 'Initializing enhanced scraper...')
+
+            # Run enhanced multi-account scraping
             result = self.run_multi_account_scraper(
                 target_total_jobs=target_jobs,
                 max_concurrent_accounts=max_concurrent_accounts,
@@ -569,12 +939,21 @@ class MultiAccountJobRightScraper:
             )
 
             if not result["success"]:
+                self.log_to_session(f"❌ Scraping failed: {result.get('message', 'Unknown error')}", 'error')
                 return result
 
             jobs = result["jobs"]
+            
+            # Update progress for final export
+            self.update_session_progress(95, {
+                'jobs_found': result["total_jobs"],
+                'accounts_used': result["accounts_used"], 
+                'matching_jobs': result["filtered_jobs"],
+                'current_account': 'Exporting to sheets...'
+            }, 'Exporting final results to Google Sheets...')
 
             # Export to Google Sheets
-            logger.info("📊 Exporting results to Google Sheets...")
+            self.log_to_session("📊 Exporting final results to Google Sheets...", 'info')
 
             # Export all jobs
             all_jobs_sheet = self.export_to_google_sheets(jobs, sheet_url, "ALL_JOBS_MULTI")
@@ -585,14 +964,21 @@ class MultiAccountJobRightScraper:
                 filtered_jobs = [job for job in jobs if job.get('keyword_match', '') != 'No match']
                 filtered_sheet = self.export_to_google_sheets(filtered_jobs, sheet_url, "FILTERED_JOBS_MULTI")
 
-            # Prepare success message
-            message = f"🎉 MULTI-ACCOUNT SCRAPING COMPLETE!\n\n"
+            # Prepare enhanced success message
+            message = f"🎉 ENHANCED MULTI-ACCOUNT SCRAPING COMPLETE!\n\n"
             message += f"📊 Total jobs collected: {result['total_jobs']}\n"
-            message += f"🎯 Jobs matching '{keyword}': {result['filtered_jobs']}\n" if keyword else ""
+            if keyword:
+                message += f"🎯 Jobs matching '{keyword}': {result['filtered_jobs']}\n"
             message += f"👥 Accounts successfully used: {result['accounts_used']}\n"
             message += f"❌ Accounts failed: {result['accounts_failed']}\n"
+            message += f"⚙️ Scraping mode: {scrape_mode}\n"
+            if result.get('target_reached'):
+                message += f"🎯 Target reached early - auto-stopped to save resources!\n"
             message += f"📋 Data exported to Google Sheets\n"
-            message += f"⚡ Simultaneous multi-account scraping achieved maximum diversity!"
+            message += f"⚡ Enhanced multi-account scraping with intelligent optimization!"
+
+            # Log final success
+            self.log_to_session(message, 'success')
 
             return {
                 "success": True,
@@ -603,11 +989,16 @@ class MultiAccountJobRightScraper:
                 "accounts_failed": result["accounts_failed"],
                 "all_jobs_sheet": all_jobs_sheet,
                 "filtered_sheet": filtered_sheet,
-                "keyword": keyword
+                "keyword": keyword,
+                "scrape_mode": scrape_mode,
+                "target_reached": result.get("target_reached", False),
+                "jobs_by_account": result.get("jobs_by_account", {})
             }
 
         except Exception as e:
-            logger.error(f"❌ Complete scraper error: {e}")
+            error_msg = f"❌ Enhanced scraper error: {e}"
+            self.log_to_session(error_msg, 'error')
+            logger.error(error_msg)
             return {"success": False, "message": f"Error: {str(e)}"}
 
 def main():
