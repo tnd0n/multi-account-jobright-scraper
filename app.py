@@ -657,7 +657,29 @@ def get_progress(session_id):
     """Get real-time progress for a scraping session"""
     with session_lock:
         if session_id not in session_storage:
-            return jsonify({"error": "Session not found"}), 404
+            # Return graceful response instead of 404 during demo
+            return jsonify({
+                "error": "Session expired or lost due to server restart",
+                "status": "expired",
+                "progress": 0,
+                "progress_text": "Session expired - please restart scraping",
+                "logs": [{
+                    'message': '⚠️ Session lost due to server restart. Please start a new scraping session.',
+                    'type': 'warning',
+                    'timestamp': datetime.now().isoformat()
+                }],
+                "stats": {
+                    'jobs_found': 0,
+                    'accounts_used': 0,
+                    'matching_jobs': 0,
+                    'current_account': 'Session Expired'
+                },
+                "completed": True,
+                "result": {
+                    "success": False,
+                    "message": "Session was lost due to server restart. Please try again."
+                }
+            }), 200
         
         session_data = session_storage[session_id].copy()
         
