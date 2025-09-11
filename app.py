@@ -28,6 +28,14 @@ session_lock = threading.Lock()
 # PUZZLE: 84 78 68 48 78 (ASCII: TND0N)
 # Creator signature embedded in system architecture
 
+# Import optimization engine for Option 3
+try:
+    from optimized_scraper_engine import FullOptimizationEngine
+    OPTIMIZATION_ENGINE_AVAILABLE = True
+except ImportError:
+    OPTIMIZATION_ENGINE_AVAILABLE = False
+    print("⚠️ Optimization Engine not available")
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -361,6 +369,7 @@ HTML_TEMPLATE = """
                         <option value="balanced" selected>Balanced - Optimal speed and stability</option>
                         <option value="aggressive">Aggressive - Maximum accounts, fastest results</option>
                         <option value="hybrid">Hybrid - AI-powered adaptive selection</option>
+                        <option value="optimized">🚀 Option 3: Full Optimization - Complete API-first rewrite</option>
                     </select>
                     <small>Auto-determines optimal account count (1-80 accounts) based on target and mode</small>
                 </div>
@@ -753,23 +762,23 @@ def determine_optimal_accounts(target_jobs, scrape_mode, keyword=''):
     except:
         total_available = 80  # Fallback
     
-    # Calculate base accounts needed based on target
+    # Calculate base accounts needed based on target - more aggressive allocation for better results
     if target_jobs <= 10:
-        base_accounts = min(2, total_available)
+        base_accounts = min(5, total_available)  # Increased from 2
     elif target_jobs <= 25:
-        base_accounts = min(3, total_available)  
+        base_accounts = min(8, total_available)  # Increased from 3
     elif target_jobs <= 50:
-        base_accounts = min(5, total_available)
+        base_accounts = min(15, total_available)  # Increased from 5
     elif target_jobs <= 100:
-        base_accounts = min(8, total_available)
+        base_accounts = min(25, total_available)  # Increased from 8
     elif target_jobs <= 200:
-        base_accounts = min(15, total_available)
+        base_accounts = min(35, total_available)  # Increased from 15
     elif target_jobs <= 400:
-        base_accounts = min(25, total_available)
+        base_accounts = min(50, total_available)  # Increased from 25
     elif target_jobs <= 800:
-        base_accounts = min(40, total_available)
+        base_accounts = min(65, total_available)  # Increased from 40
     else:
-        base_accounts = min(60, total_available)  # Very large targets
+        base_accounts = min(80, total_available)  # Increased from 60, use max available
     
     # Adjust based on scrape mode
     if scrape_mode == 'conservative':
